@@ -22,6 +22,7 @@ type Limit float64
 const Inf = Limit(math.MaxFloat64)
 
 // Every converts a minimum time interval between events to a Limit.
+// 特定时间间隔内允许发生的事件数，比如每1s允许发生10个事件，那么interval=100ms，则limit=10
 func Every(interval time.Duration) Limit {
 	if interval <= 0 {
 		return Inf
@@ -55,13 +56,20 @@ func Every(interval time.Duration) Limit {
 //
 // Limiter is safe for simultaneous use by multiple goroutines.
 type Limiter struct {
-	mu     sync.Mutex
-	limit  Limit
-	burst  int
+	// 锁
+	mu sync.Mutex
+	// 限速r，每秒允许limit个token
+	limit Limit
+	// 令牌桶的最大burst，即允许的突发token最大数量，允许突发流量的最大值
+	burst int
+	// 当前令牌桶中的可用token数量
 	tokens float64
 	// last is the last time the limiter's tokens field was updated
+	// 最近一次更新令牌桶的时刻
 	last time.Time
 	// lastEvent is the latest time of a rate-limited event (past or future)
+	// 最近一次事件发生的时间
+	// last：表示最近一次申请token的时间，lastEvent表示最近一次事件发生的时间（获取到令牌的时间）
 	lastEvent time.Time
 }
 
@@ -105,6 +113,7 @@ func NewLimiter(r Limit, b int) *Limiter {
 }
 
 // Allow reports whether an event may happen now.
+// 当前是否允许事件发生，如果返回true，则表示可以立即执行，否则不能执行
 func (lim *Limiter) Allow() bool {
 	return lim.AllowN(time.Now(), 1)
 }
@@ -112,6 +121,7 @@ func (lim *Limiter) Allow() bool {
 // AllowN reports whether n events may happen at time t.
 // Use this method if you intend to drop / skip events that exceed the rate limit.
 // Otherwise use Reserve or Wait.
+// 当前是否允许n个事件发生，如果返回true，则表示可以立即执行，否则不能执行
 func (lim *Limiter) AllowN(t time.Time, n int) bool {
 	return lim.reserveN(t, n, 0).ok
 }
@@ -119,11 +129,14 @@ func (lim *Limiter) AllowN(t time.Time, n int) bool {
 // A Reservation holds information about events that are permitted by a Limiter to happen after a delay.
 // A Reservation may be canceled, which may enable the Limiter to permit additional events.
 type Reservation struct {
-	ok        bool
-	lim       *Limiter
-	tokens    int
+	ok  bool
+	lim *Limiter
+	// 预订的tokens数量，也就是申请的数量
+	tokens int
+	// 可执行的时间，也就是满足申请数量的时间
 	timeToAct time.Time
 	// This is the Limit at reservation time, it can change later.
+	// TODO 这个的用途是什么？
 	limit Limit
 }
 
@@ -203,6 +216,7 @@ func (r *Reservation) CancelAt(t time.Time) {
 }
 
 // Reserve is shorthand for ReserveN(time.Now(), 1).
+// 申请1个token，返回一个Reservation对象，该对象指示了等待多长时间后才能获得这个token
 func (lim *Limiter) Reserve() *Reservation {
 	return lim.ReserveN(time.Now(), 1)
 }
@@ -223,6 +237,8 @@ func (lim *Limiter) Reserve() *Reservation {
 // Use this method if you wish to wait and slow down in accordance with the rate limit without dropping events.
 // If you need to respect a deadline or cancel the delay, use Wait instead.
 // To drop or skip events exceeding rate limit, use Allow instead.
+// 申请n个token，返回一个Reservation对象，该对象指示了等待多长时间后才能获得这n个token
+// maxFutureReserve参数使用InfDuration，表示可等待时间无限大，具体等待时间由n的数量决定
 func (lim *Limiter) ReserveN(t time.Time, n int) *Reservation {
 	r := lim.reserveN(t, n, InfDuration)
 	return &r
@@ -237,6 +253,11 @@ func (lim *Limiter) Wait(ctx context.Context) (err error) {
 // It returns an error if n exceeds the Limiter's burst size, the Context is
 // canceled, or the expected wait time exceeds the Context's Deadline.
 // The burst limit is ignored if the rate limit is Inf.
+// 阻塞请求直到获取到足够数量的tokens
+// 下面集中情况返回error：
+// 1. n > burst，当limit为Inf时，不校验burst，也就是可以申请任意数量的token
+// 2. ctx被cancelled取消
+// 3. 等待时间超过ctx的deadline
 func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 	// The test code calls lim.wait with a fake timer generator.
 	// This is the real timer generator.
@@ -244,11 +265,17 @@ func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 		timer := time.NewTimer(d)
 		return timer.C, timer.Stop, func() {}
 	}
+	// 可以看到，为了满足测试需要，代码编写上会做特殊处理，以方便支持测试
 
 	return lim.wait(ctx, n, time.Now(), newTimer)
 }
 
 // wait is the internal implementation of WaitN.
+// 从t时刻开始，等待获取总数为n的令牌数
+// 第4个参数也太脏了
+// newTimer func(d time.Duration) (<-chan time.Time, func() bool, func())
+// 参数变量为newTimer，类型为func(d time.Duration) (<-chan time.Time, func() bool, func())
+// 也就是说，func作为类型时，需要写明函数签名（入参和返回值）
 func (lim *Limiter) wait(ctx context.Context, n int, t time.Time, newTimer func(d time.Duration) (<-chan time.Time, func() bool, func())) error {
 	lim.mu.Lock()
 	burst := lim.burst
@@ -333,17 +360,25 @@ func (lim *Limiter) SetBurstAt(t time.Time, newBurst int) {
 // reserveN is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 // reserveN returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
+// maxFutureReserve几个入参的值：
+// 1. 0，表示不等待，对应AllowN使用
+// 2. InfDuration，表示不限等待时间，对应ReserveN使用
+// 3. ctx超时时间，表示等待时间不能超过ctx的deadline时间，对应WaitN使用
 func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration) Reservation {
+	// 加锁
 	lim.mu.Lock()
 	defer lim.mu.Unlock()
 
+	// limit = Inf，表示不限速
 	if lim.limit == Inf {
 		return Reservation{
-			ok:        true,
+			ok:        true, // 当前校验结果通过
 			lim:       lim,
 			tokens:    n,
 			timeToAct: t,
 		}
+		// 限速为0，此时只看是否超过burst
+		// 限速为0，具体作用是什么？？？TODO
 	} else if lim.limit == 0 {
 		var ok bool
 		if lim.burst >= n {
@@ -358,18 +393,23 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 		}
 	}
 
+	// 计算截止时间t时刻，更新lim可用tokens数量：桶中剩余+间隔时间内心生产token数（总数不超过桶容量burst）
 	t, tokens := lim.advance(t)
 
 	// Calculate the remaining number of tokens resulting from the request.
+	// 减去当前申请使用token数量n
 	tokens -= float64(n)
 
 	// Calculate the wait duration
 	var waitDuration time.Duration
+	// 结果为负值，则说明超过可用数量
 	if tokens < 0 {
+		// 计算需要等待的时间，超出数量-tokens个，利用durationFromTokens计算需等待时间
 		waitDuration = lim.limit.durationFromTokens(-tokens)
 	}
 
 	// Decide result
+	// 申请量n未超过桶容量，且等待时间不超过最大允许等待时间（也就是说可用）
 	ok := n <= lim.burst && waitDuration <= maxFutureReserve
 
 	// Prepare reservation
@@ -379,14 +419,22 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 		limit: lim.limit,
 	}
 	if ok {
+		// tokens到底表示什么？为什么把n赋值给tokens呢？
+		// TODO
 		r.tokens = n
+		// 可执行的是啊金
 		r.timeToAct = t.Add(waitDuration)
 
 		// Update state
+		// 更新上次处理时间，更新桶内令牌数量
 		lim.last = t
+		// 更新桶内令牌数量（桶内剩余/可用令牌数）
 		lim.tokens = tokens
+		// 更新最后一次事件的时间，也就是申请后最后可执行的时间
 		lim.lastEvent = r.timeToAct
 	}
+
+	// 对于ok=false的情况，tokens和timeToAct都未赋值，因此返回的Reservation中这两个字段为零值，lim也不会更新
 
 	return r
 }
@@ -394,16 +442,24 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
+// 计算并返回经过时间t后，lim的状态
 func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 	last := lim.last
+	// 这里为何要这么处理？为了确保下面计算时间间隔时，结果为0。防止出现负数？
+	// TODO
 	if t.Before(last) {
 		last = t
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
+	// 计算经过时间t后，lim的tokens数量
+	// 1. 计算距离最后一次处理时的时间差
 	elapsed := t.Sub(last)
+	// 2. 根据时间差计算可生产的tokens数量，lazyload思想
 	delta := lim.limit.tokensFromDuration(elapsed)
+	// 3. 更新tokens数量，桶内原有令牌数+这段时间内可产生的新增令牌数
 	tokens := lim.tokens + delta
+	// 4. 计算新的tokens数量，确保不超过桶容量burst
 	if burst := float64(lim.burst); tokens > burst {
 		tokens = burst
 	}
@@ -412,6 +468,7 @@ func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
 // of time it takes to accumulate them at a rate of limit tokens per second.
+// 生产tokens数量的token需要多少时间
 func (limit Limit) durationFromTokens(tokens float64) time.Duration {
 	if limit <= 0 {
 		return InfDuration
@@ -422,6 +479,7 @@ func (limit Limit) durationFromTokens(tokens float64) time.Duration {
 
 // tokensFromDuration is a unit conversion function from a time duration to the number of tokens
 // which could be accumulated during that duration at a rate of limit tokens per second.
+// 给定时间间隔d，可以生产多少数量的token
 func (limit Limit) tokensFromDuration(d time.Duration) float64 {
 	if limit <= 0 {
 		return 0
