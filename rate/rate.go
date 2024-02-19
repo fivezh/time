@@ -136,7 +136,7 @@ type Reservation struct {
 	// 可执行的时间，也就是满足申请数量的时间
 	timeToAct time.Time
 	// This is the Limit at reservation time, it can change later.
-	// TODO 这个的用途是什么？
+	// 由于limit可以动态调整，所以在reservation上保留一份当时申请时的数据备份
 	limit Limit
 }
 
@@ -148,6 +148,7 @@ func (r *Reservation) OK() bool {
 }
 
 // Delay is shorthand for DelayFrom(time.Now()).
+// 获取预订令牌需要延迟等待的时间
 func (r *Reservation) Delay() time.Duration {
 	return r.DelayFrom(time.Now())
 }
@@ -159,6 +160,7 @@ const InfDuration = time.Duration(math.MaxInt64)
 // before taking the reserved action.  Zero duration means act immediately.
 // InfDuration means the limiter cannot grant the tokens requested in this
 // Reservation within the maximum wait time.
+// 根据r.timeToAct时间，计算出需要延迟的时间
 func (r *Reservation) DelayFrom(t time.Time) time.Duration {
 	if !r.ok {
 		return InfDuration
@@ -171,6 +173,7 @@ func (r *Reservation) DelayFrom(t time.Time) time.Duration {
 }
 
 // Cancel is shorthand for CancelAt(time.Now()).
+// 取消预订令牌，释放令牌
 func (r *Reservation) Cancel() {
 	r.CancelAt(time.Now())
 }
@@ -179,13 +182,19 @@ func (r *Reservation) Cancel() {
 // and reverses the effects of this Reservation on the rate limit as much as possible,
 // considering that other reservations may have already been made.
 func (r *Reservation) CancelAt(t time.Time) {
+	// 未获取到令牌，则直接返回
 	if !r.ok {
 		return
 	}
 
+	// 全过程加锁
 	r.lim.mu.Lock()
 	defer r.lim.mu.Unlock()
 
+	// 无限速、预订tokens为0、预订时间小于当前时间，则直接返回
+	// 为何预订时间小于当前时间，就直接返回呢？不需要释放资源吗？
+	// 取消操作，仅会发生在ctx取消或超时情况下，此时r.timeToAct正常应该还未到达。
+	// 如果已到达执行时间，说明已正常使用令牌，也就无需释放操作了
 	if r.lim.limit == Inf || r.tokens == 0 || r.timeToAct.Before(t) {
 		return
 	}
@@ -193,6 +202,13 @@ func (r *Reservation) CancelAt(t time.Time) {
 	// calculate tokens to restore
 	// The duration between lim.lastEvent and r.timeToAct tells us how many tokens were reserved
 	// after r was obtained. These tokens should not be restored.
+	// 计算需要恢复的令牌数量
+	// 问题：TODO
+	// 1、为何r.timeToAct和lim.lastEvent之差来计算token数？而不是直接把r.tokens直接返还？
+	// 1.1 因为随着执行时间，已经有一些时间被消耗，那这段时间对应的token应该被剔除
+	// 1.2 如果lastEvent未被其他请求刷新，那么r.limit.lastEent==r.timeToAct，此时直接恢复r.tokens即可
+	// 1.3 如果lastEvent被其他请求刷新了，那么r.limit.lastEent>r.timeToAct，此时如何计算正确的退还tokens数量呢？
+	// 2、这里r.lim.lastEvent是否会有并发操作问题，比如其他请求更新了lastEvent后？？
 	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct))
 	if restoreTokens <= 0 {
 		return
@@ -255,7 +271,7 @@ func (lim *Limiter) Wait(ctx context.Context) (err error) {
 // The burst limit is ignored if the rate limit is Inf.
 // 阻塞请求直到获取到足够数量的tokens
 // 下面集中情况返回error：
-// 1. n > burst，当limit为Inf时，不校验burst，也就是可以申请任意数量的token
+// 1. n > burst && limit != Inf ，当limit为Inf时，不校验burst，也就是可以申请任意数量的token
 // 2. ctx被cancelled取消
 // 3. 等待时间超过ctx的deadline
 func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
@@ -277,45 +293,59 @@ func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 // 参数变量为newTimer，类型为func(d time.Duration) (<-chan time.Time, func() bool, func())
 // 也就是说，func作为类型时，需要写明函数签名（入参和返回值）
 func (lim *Limiter) wait(ctx context.Context, n int, t time.Time, newTimer func(d time.Duration) (<-chan time.Time, func() bool, func())) error {
+	// 先加锁
 	lim.mu.Lock()
 	burst := lim.burst
 	limit := lim.limit
+	// 为何这么快就解锁了呢？？后面操作不需要锁吗？TODO
 	lim.mu.Unlock()
 
+	// 非无限limit时，超过burst直接返回error
 	if n > burst && limit != Inf {
 		return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", n, burst)
 	}
 	// Check if ctx is already cancelled
+	// 校验一次是否已取消
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
 	// Determine wait limit
+	// 计算可等待的最大时间，默认无限，如ctx的deadline存在，则取deadline减去当前时间计算出可等待时间
 	waitLimit := InfDuration
 	if deadline, ok := ctx.Deadline(); ok {
 		waitLimit = deadline.Sub(t)
 	}
 	// Reserve
+	// 预订申请令牌
 	r := lim.reserveN(t, n, waitLimit)
+	// 只有超过waitLimit一种情况会返回!ok，也就是没有足够时间生成对应数量的令牌
 	if !r.ok {
 		return fmt.Errorf("rate: Wait(n=%d) would exceed context deadline", n)
 	}
 	// Wait if necessary
+	// 计算需要等待时间长度
 	delay := r.DelayFrom(t)
+	// 等待时间长度为0，则直接返回
 	if delay == 0 {
 		return nil
 	}
+
+	// 需要等待的情况
 	ch, stop, advance := newTimer(delay)
 	defer stop()
 	advance() // only has an effect when testing
 	select {
+	// 计时器等待时间到，则返回nil，表示获取到了足够的令牌
 	case <-ch:
 		// We can proceed.
 		return nil
 	case <-ctx.Done():
+		// ctx被取消，则返回错误
 		// Context was canceled before we could proceed.  Cancel the
 		// reservation, which may permit other events to proceed sooner.
+		// 取消预订操作，释放令牌
 		r.Cancel()
 		return ctx.Err()
 	}
@@ -379,6 +409,7 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 		}
 		// 限速为0，此时只看是否超过burst
 		// 限速为0，具体作用是什么？？？TODO
+		// 生产速度为0，但桶内可用burst仅为初始的burst个，用完就没了？？
 	} else if lim.limit == 0 {
 		var ok bool
 		if lim.burst >= n {
@@ -445,15 +476,15 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 // 计算并返回经过时间t后，lim的状态
 func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 	last := lim.last
-	// 这里为何要这么处理？为了确保下面计算时间间隔时，结果为0。防止出现负数？
-	// TODO
+	// 这里为何要这么处理？为了确保下面计算时间间隔时，结果为0。防止出现负数
 	if t.Before(last) {
 		last = t
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
 	// 计算经过时间t后，lim的tokens数量
-	// 1. 计算距离最后一次处理时的时间差
+	// 1. 计算距离上一次处理时的时间差
+	// TODO：注意这个时间是last，而不是lastEvent
 	elapsed := t.Sub(last)
 	// 2. 根据时间差计算可生产的tokens数量，lazyload思想
 	delta := lim.limit.tokensFromDuration(elapsed)
