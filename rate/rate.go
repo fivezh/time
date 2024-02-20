@@ -210,12 +210,17 @@ func (r *Reservation) CancelAt(t time.Time) {
 	// 1.3 如果lastEvent被其他请求刷新了，那么r.limit.lastEent>r.timeToAct，此时如何计算正确的退还tokens数量呢？
 	// 2、这里r.lim.lastEvent是否会有并发操作问题，比如其他请求更新了lastEvent后？？
 	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct))
+	fmt.Println("lim.lastEvent-r.timeToAck:", r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct)))
+	// t3-t2=1
+	fmt.Println("restoreTokens:", restoreTokens) // 2-1=1
 	if restoreTokens <= 0 {
 		return
 	}
 	// advance time to now
 	t, tokens := r.lim.advance(t)
+	fmt.Println("advance tokens:", tokens) // -2
 	// calculate new number of tokens
+	// -2+1=-1
 	tokens += restoreTokens
 	if burst := float64(r.lim.burst); tokens > burst {
 		tokens = burst
@@ -223,12 +228,19 @@ func (r *Reservation) CancelAt(t time.Time) {
 	// update state
 	r.lim.last = t
 	r.lim.tokens = tokens
+	fmt.Println("cancel Done:", r.lim.last, " r.lim.tokens:", r.lim.tokens)
+
+	// 如果r是最后一个预约token
 	if r.timeToAct == r.lim.lastEvent {
+		// 时间回退-r.tokens对应的时间
 		prevEvent := r.timeToAct.Add(r.limit.durationFromTokens(float64(-r.tokens)))
 		if !prevEvent.Before(t) {
 			r.lim.lastEvent = prevEvent
 		}
 	}
+
+	// 非最后一个预约时，并不会更新lim.lastEvent
+	// 也就是说，取消预约时，会释放token，但并不会改变已取的预约令牌的r.timeToAct和lim.lastEvent
 }
 
 // Reserve is shorthand for ReserveN(time.Now(), 1).
@@ -426,10 +438,17 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 
 	// 计算截止时间t时刻，更新lim可用tokens数量：桶中剩余+间隔时间内心生产token数（总数不超过桶容量burst）
 	t, tokens := lim.advance(t)
+	// fmt.Println(tokens, n)
+	if n == 2 {
+		fmt.Println("advance:", tokens)
+	}
 
 	// Calculate the remaining number of tokens resulting from the request.
 	// 减去当前申请使用token数量n
 	tokens -= float64(n)
+	if n == 2 {
+		fmt.Println("calc tokens:", tokens)
+	}
 
 	// Calculate the wait duration
 	var waitDuration time.Duration
@@ -437,6 +456,9 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 	if tokens < 0 {
 		// 计算需要等待的时间，超出数量-tokens个，利用durationFromTokens计算需等待时间
 		waitDuration = lim.limit.durationFromTokens(-tokens)
+	}
+	if n == 2 {
+		fmt.Println("waitDuration:", waitDuration) // 500ms
 	}
 
 	// Decide result
@@ -463,6 +485,12 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 		lim.tokens = tokens
 		// 更新最后一次事件的时间，也就是申请后最后可执行的时间
 		lim.lastEvent = r.timeToAct
+		// fmt.Println("-----get-----")
+		// fmt.Printf("lim=%#v\n", lim)
+		// fmt.Printf("r=%#v\n", r)
+		fmt.Printf("r.tokens=%d, r.timeToAck=%s\n", r.tokens, r.timeToAct)
+		fmt.Printf("lim.tokens=%f, lim.last=%s, lim.lastEvent=%s  \n", lim.tokens, lim.last, lim.lastEvent)
+		fmt.Println("-------------------")
 	}
 
 	// 对于ok=false的情况，tokens和timeToAct都未赋值，因此返回的Reservation中这两个字段为零值，lim也不会更新
@@ -476,6 +504,7 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 // 计算并返回经过时间t后，lim的状态
 func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 	last := lim.last
+	// fmt.Println(last)
 	// 这里为何要这么处理？为了确保下面计算时间间隔时，结果为0。防止出现负数
 	if t.Before(last) {
 		last = t
@@ -486,6 +515,8 @@ func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 	// 1. 计算距离上一次处理时的时间差
 	// TODO：注意这个时间是last，而不是lastEvent
 	elapsed := t.Sub(last)
+	// 初始时last为空，则elapsed为maxDuration
+	// fmt.Println(int64(elapsed) == (1<<63 - 1)) // true
 	// 2. 根据时间差计算可生产的tokens数量，lazyload思想
 	delta := lim.limit.tokensFromDuration(elapsed)
 	// 3. 更新tokens数量，桶内原有令牌数+这段时间内可产生的新增令牌数
@@ -494,6 +525,7 @@ func (lim *Limiter) advance(t time.Time) (newT time.Time, newTokens float64) {
 	if burst := float64(lim.burst); tokens > burst {
 		tokens = burst
 	}
+	// fmt.Println(tokens, lim.burst)
 	return t, tokens
 }
 

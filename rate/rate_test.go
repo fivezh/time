@@ -6,6 +6,7 @@ package rate
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,11 @@ func TestLimit(t *testing.T) {
 }
 
 func closeEnough(a, b Limit) bool {
-	return (math.Abs(float64(a)/float64(b)) - 1.0) < 1e-9
+	// fmt.Println(math.Abs(float64(a) / float64(b)))
+	// fmt.Println((math.Abs(float64(a)/float64(b)) - 1.0))
+	// fmt.Println((math.Abs(float64(a)/float64(b)) - 1.0) < 1e-9)
+	// 这里case有bug
+	return (math.Abs(float64(a)/float64(b) - 1.0)) < 1e-9
 }
 
 func TestEvery(t *testing.T) {
@@ -44,6 +49,7 @@ func TestEvery(t *testing.T) {
 	}
 	for _, tc := range cases {
 		lim := Every(tc.interval)
+		// fmt.Println(lim, tc.lim)
 		if !closeEnough(lim, tc.lim) {
 			t.Errorf("Every(%v) = %v want %v", tc.interval, lim, tc.lim)
 		}
@@ -56,12 +62,13 @@ const (
 
 var (
 	t0 = time.Now()
-	t1 = t0.Add(time.Duration(1) * d)
-	t2 = t0.Add(time.Duration(2) * d)
-	t3 = t0.Add(time.Duration(3) * d)
+	t1 = t0.Add(time.Duration(1) * d) // now+100ms
+	t2 = t0.Add(time.Duration(2) * d) // now+200ms
+	t3 = t0.Add(time.Duration(3) * d) // now+300ms
 	t4 = t0.Add(time.Duration(4) * d)
 	t5 = t0.Add(time.Duration(5) * d)
-	t9 = t0.Add(time.Duration(9) * d)
+	t6 = t0.Add(time.Duration(6) * d)
+	t9 = t0.Add(time.Duration(9) * d) // now+900ms
 )
 
 type allow struct {
@@ -88,22 +95,31 @@ func run(t *testing.T, lim *Limiter, allows []allow) {
 
 func TestLimiterBurst1(t *testing.T) {
 	run(t, NewLimiter(10, 1), []allow{
+		// 初始1个令牌，预订消费1个，剩余0个
 		{t0, 1, 1, true},
+		// 当前令牌数为0，再次预订1个，预订结果false
 		{t0, 0, 1, false},
 		{t0, 0, 1, false},
+		// 100ms后，已新增生产1个令牌，消费1个也应该成功
 		{t1, 1, 1, true},
+		// 已消费1个，此时可用0个，再次预订1个，预订结果false
 		{t1, 0, 1, false},
 		{t1, 0, 1, false},
+		// 200ms，已又新生产1个token
 		{t2, 1, 2, false}, // burst size is 1, so n=2 always fails
 		{t2, 1, 1, true},
+		// 已消费1个，可用0，再次消费失败
 		{t2, 0, 1, false},
 	})
 }
 
 func TestLimiterBurst3(t *testing.T) {
 	run(t, NewLimiter(10, 3), []allow{
+		// 初始3个令牌，消费2个，剩余1个
 		{t0, 3, 2, true},
+		// 当前1个，预约2个，预订结果false
 		{t0, 1, 2, false},
+		// 当前1个，预约1个，预订结果true
 		{t0, 1, 1, true},
 		{t0, 0, 1, false},
 		{t1, 1, 4, false},
@@ -368,12 +384,36 @@ func TestCancelInvalid(t *testing.T) {
 	runReserve(t, lim, request{t0, 2, t2, true}) // did not get extra tokens
 }
 
+func TestCancelFivezhLast(t *testing.T) {
+	lim := NewLimiter(10, 3)
+
+	// 初始2个，首次预约2个，消费成功，可用tokens=0
+	runReserve(t, lim, request{t0, 3, t0, true})
+	// 再次预约1个，r1.timeToAct时间是t1，可用tokens=-1
+	r1 := runReserve(t, lim, request{t0, 2, t2, true})
+	// t2+1=t3, lim.tokens=-3, r.timeToAct=t3
+	r2 := runReserve(t, lim, request{t0, 1, t3, true})
+	// _ = r1
+	// _ = r2
+	r1.CancelAt(t1) // got how many tokens back;
+	fmt.Println(lim.TokensAt(t1), lim.last, lim.lastEvent)
+	_ = r2
+	// t1时刻取消预约，退还tokens=2，t1-t0新生产1个，则有效tokens=-2+1+2=1
+	// r1.CancelAt(t1) // got 2 tokens back
+	// // t1消费2个，lim.tokens=-1，r.timeToAct=t2
+	// runReserve(t, lim, request{t1, 2, t2, true})
+}
 func TestCancelLast(t *testing.T) {
 	lim := NewLimiter(10, 2)
 
+	// 初始2个，首次预约2个，消费成功，可用tokens=0
 	runReserve(t, lim, request{t0, 2, t0, true})
+	// 再次预约2个，timeToAct时间是t2，可用tokens=-2
 	r := runReserve(t, lim, request{t0, 2, t2, true})
+	// _ = r
+	// t1时刻取消预约，退还tokens=2，t1-t0新生产1个，则有效tokens=-2+1+2=1
 	r.CancelAt(t1) // got 2 tokens back
+	// t1消费2个，lim.tokens=-1，r.timeToAct=t2
 	runReserve(t, lim, request{t1, 2, t2, true})
 }
 
@@ -400,10 +440,48 @@ func TestCancel1Token(t *testing.T) {
 	lim := NewLimiter(10, 2)
 
 	runReserve(t, lim, request{t0, 2, t0, true})
+
+	// 可用0个token，预约2个，r.timeToAct=t2，lim.tokens=-2
 	r := runReserve(t, lim, request{t0, 2, t2, true})
+	fmt.Println("1 first: ", r.timeToAct == t2, ", lim.tokens:", lim.tokens)
+	// 1 first:  true, lim.tokens: -2
+
+	// 可用-2个token，预约1个，lim.lastEvent=t3，lim.tokens=-3
 	runReserve(t, lim, request{t0, 1, t3, true})
+	fmt.Println("2 second: ", lim.lastEvent == t3, ", lim.tokens:", lim.tokens)
+	// 2 second:  true , lim.tokens: -3
+
+	// 在t2时刻取消r预约
+	// r.CancelAt(t2) // got 1 token back
 	r.CancelAt(t2) // got 1 token back
+	// 3 third:  true , lim.tokens: 0
+	fmt.Println("3 third: ", lim.lastEvent == t3, ", lim.tokens:", lim.tokens)
+
 	runReserve(t, lim, request{t2, 2, t4, true})
+}
+
+func TestCancel1TokenFivezh(t *testing.T) {
+	lim := NewLimiter(10, 6)
+
+	runReserve(t, lim, request{t0, 6, t0, true})
+
+	// 可用0个token，预约2个，r.timeToAct=t2，lim.tokens=-2
+	r := runReserve(t, lim, request{t0, 4, t4, true})
+	fmt.Println("1 first: ", r.timeToAct == t4, ", lim.tokens:", lim.tokens)
+	// 1 first:  true, lim.tokens: -4
+
+	// 可用-2个token，预约1个，lim.lastEvent=t3，lim.tokens=-3
+	runReserve(t, lim, request{t0, 2, t6, true})
+	fmt.Println("2 second: ", lim.lastEvent == t6, ", lim.tokens:", lim.tokens)
+	// 2 second:  true , lim.tokens: -3
+
+	// 在t2时刻取消r预约
+	// r.CancelAt(t2) // got 1 token back
+	r.CancelAt(t1) // got 2 token back
+	// // 3 third:  true , lim.tokens: 0
+	fmt.Println("3 third: ", lim.lastEvent == t6, ", lim.tokens:", lim.tokens)
+
+	// runReserve(t, lim, request{t2, 2, t4, true})
 }
 
 func TestCancelMulti(t *testing.T) {
@@ -413,7 +491,11 @@ func TestCancelMulti(t *testing.T) {
 	rA := runReserve(t, lim, request{t0, 3, t3, true})
 	runReserve(t, lim, request{t0, 1, t4, true})
 	rC := runReserve(t, lim, request{t0, 1, t5, true})
+	// lim.lastEvent回退到t4，lim.tokens=-3
 	rC.CancelAt(t1) // get 1 token back
+	fmt.Println("++++: ", lim.lastEvent == t4, ", lim.tokens:", lim.tokens)
+
+	// lim.lastEvent仍保持t4, lim.tokens=-3
 	rA.CancelAt(t1) // get 2 tokens back, as if C was never reserved
 	runReserve(t, lim, request{t1, 3, t5, true})
 }
